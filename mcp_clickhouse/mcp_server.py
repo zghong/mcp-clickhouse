@@ -1,6 +1,8 @@
 import logging
 import asyncio
 import json
+import threading
+import time
 import uuid
 from typing import Optional, List, Any, Dict
 import concurrent.futures
@@ -12,6 +14,7 @@ from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+from starlette.responses import PlainTextResponse
 from dataclasses import dataclass, field, asdict
 
 from mcp_clickhouse.mcp_env import get_config, get_mcp_config, TransportType
@@ -92,6 +95,79 @@ if mcp_config.mcp_server_transport in http_transports:
         )
 
 mcp = FastMCP(name=MCP_SERVER_NAME, auth=auth_provider)
+
+# --- Health endpoint with 1s result cache (ported from 4fea804) ------------
+_HEALTH_CHECK_TIMEOUT_SECONDS = 2.0
+_HEALTH_RESULT_CACHE_SECONDS = 1.0
+_health_state_lock = threading.Lock()
+_health_probe_future: Optional[concurrent.futures.Future] = None
+_health_result_cache: Optional[tuple] = None  # (expiry_monotonic, healthy)
+_HEALTH_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+atexit.register(lambda: _HEALTH_EXECUTOR.shutdown(wait=False))
+
+
+def _probe_clickhouse_health() -> None:
+    """Run an authenticated ClickHouse health query with a cached client."""
+    client = create_clickhouse_client()
+    client.command("SELECT 1")
+
+
+def _cached_health_result() -> Optional[bool]:
+    """Return the cached health result if it is still fresh."""
+    with _health_state_lock:
+        if _health_result_cache is not None and time.monotonic() < _health_result_cache[0]:
+            return _health_result_cache[1]
+    return None
+
+
+def _get_health_probe_future() -> concurrent.futures.Future:
+    """Return the single in-flight ClickHouse health probe."""
+    global _health_probe_future
+    with _health_state_lock:
+        if _health_probe_future is not None and not _health_probe_future.done():
+            return _health_probe_future
+        future = _HEALTH_EXECUTOR.submit(_probe_clickhouse_health)
+        _health_probe_future = future
+
+    def _cache_result(done: concurrent.futures.Future) -> None:
+        global _health_result_cache
+        if done.cancelled():
+            return
+        healthy = done.exception() is None
+        with _health_state_lock:
+            _health_result_cache = (time.monotonic() + _HEALTH_RESULT_CACHE_SECONDS, healthy)
+
+    future.add_done_callback(_cache_result)
+    return future
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request) -> PlainTextResponse:
+    """Liveness probe: OK if the server can connect to ClickHouse.
+
+    A completed probe result is reused for one second, so a failure or a
+    recovery can be reported up to a second late (4fea804).
+    """
+    cached = _cached_health_result()
+    if cached is not None:
+        return PlainTextResponse("OK") if cached else PlainTextResponse(
+            "ERROR. ClickHouse connection failed. Check server logs for details.",
+            status_code=503,
+        )
+
+    future = _get_health_probe_future()
+    try:
+        await asyncio.wait_for(asyncio.wrap_future(future), timeout=_HEALTH_CHECK_TIMEOUT_SECONDS)
+        return PlainTextResponse("OK")
+    except asyncio.TimeoutError:
+        logger.warning("Health check timed out")
+        return PlainTextResponse("ERROR. ClickHouse health check timed out.", status_code=503)
+    except Exception as e:
+        logger.warning(f"Health check failed: {e}")
+        return PlainTextResponse(
+            "ERROR. ClickHouse connection failed. Check server logs for details.",
+            status_code=503,
+        )
 
 
 def result_to_table(query_columns, result) -> List[Table]:
@@ -345,8 +421,20 @@ def _format_connection_failure(error: Exception, client_config: dict) -> str:
     return message
 
 
-def create_clickhouse_client():
-    client_config = get_config().get_client_config()
+# --- Client connection reuse (ported from 0893019, simplified) -------------
+# A single config (internal use: one cluster) maps to one cached client.
+# The client is pinged after an idle period and re-created when dead.
+_CLIENT_IDLE_PING_SECONDS = 60.0
+_client_cache_lock = threading.Lock()
+_client_cache: Dict[tuple, Any] = {}
+
+
+def _client_cache_key(client_config: dict) -> tuple:
+    """Stable cache key from the client config dict."""
+    return tuple(sorted((k, str(v)) for k, v in client_config.items()))
+
+
+def _create_clickhouse_client(client_config: dict):
     logger.info(
         f"Creating ClickHouse client connection to {client_config['host']}:{client_config['port']} "
         f"as {client_config['username']} "
@@ -366,6 +454,45 @@ def create_clickhouse_client():
         message = _format_connection_failure(e, client_config)
         logger.error(message)
         raise
+
+
+def create_clickhouse_client():
+    """Return a cached, reused ClickHouse client (0893019).
+
+    Falls back to per-call creation only if the cached client cannot be
+    health-checked, so a broken connection never blocks tool calls.
+    """
+    client_config = get_config().get_client_config()
+    key = _client_cache_key(client_config)
+
+    with _client_cache_lock:
+        entry = _client_cache.get(key)
+        if entry is not None:
+            _client_cache[key] = (entry[0], time.monotonic())
+            if time.monotonic() - entry[1] <= _CLIENT_IDLE_PING_SECONDS:
+                logger.debug("Reusing cached ClickHouse client")
+                return entry[0]
+
+    # Cache miss or client idle too long: verify it is still alive.
+    if entry is not None:
+        try:
+            if entry[0].ping():
+                with _client_cache_lock:
+                    _client_cache[key] = (entry[0], time.monotonic())
+                logger.debug("Reusing cached ClickHouse client (ping OK after idle)")
+                return entry[0]
+        except Exception:
+            pass
+        # Dead client: drop it and create a fresh one below.
+        try:
+            entry[0].close()
+        except Exception:
+            pass
+
+    client = _create_clickhouse_client(client_config)
+    with _client_cache_lock:
+        _client_cache[key] = (client, time.monotonic())
+    return client
 
 
 def get_readonly_setting(client) -> str:

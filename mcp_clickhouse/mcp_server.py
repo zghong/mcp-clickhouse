@@ -59,14 +59,7 @@ SELECT_QUERY_TIMEOUT_SECS = 30
 
 load_dotenv()
 
-mcp = FastMCP(
-    name=MCP_SERVER_NAME,
-    dependencies=[
-        "clickhouse-connect",
-        "python-dotenv",
-        "pip-system-certs",
-    ],
-)
+mcp = FastMCP(name=MCP_SERVER_NAME)
 
 
 def result_to_table(query_columns, result) -> List[Table]:

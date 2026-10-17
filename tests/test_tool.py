@@ -42,49 +42,54 @@ class TestClickhouseTools(unittest.TestCase):
 
     def test_list_databases(self):
         """Test listing databases."""
-        result = list_databases.fn()
+        result = list_databases()
         # Parse JSON response
         databases = json.loads(result)
         self.assertIn(self.test_db, databases)
 
     def test_list_tables_without_like(self):
         """Test listing tables without a 'LIKE' filter."""
-        result = list_tables.fn(self.test_db)
-        self.assertIsInstance(result, list)
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["name"], self.test_table)
+        result = list_tables(self.test_db)
+        self.assertIsInstance(result, str)
+        tables = json.loads(result)
+        self.assertEqual(len(tables), 1)
+        self.assertEqual(tables[0]["name"], self.test_table)
 
     def test_list_tables_with_like(self):
         """Test listing tables with a 'LIKE' filter."""
-        result = list_tables.fn(self.test_db, like=f"{self.test_table}%")
-        self.assertIsInstance(result, list)
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["name"], self.test_table)
+        result = list_tables(self.test_db, like=f"{self.test_table}%")
+        self.assertIsInstance(result, str)
+        tables = json.loads(result)
+        self.assertEqual(len(tables), 1)
+        self.assertEqual(tables[0]["name"], self.test_table)
 
     def test_run_select_query_success(self):
-        """Test running a SELECT query successfully."""
+        """Test running a SELECT query successfully (returns a JSON string)."""
+        import asyncio
         query = f"SELECT * FROM {self.test_db}.{self.test_table}"
-        result = run_select_query.fn(query)
-        self.assertIsInstance(result, dict)
-        self.assertEqual(len(result["rows"]), 2)
-        self.assertEqual(result["rows"][0][0], 1)
-        self.assertEqual(result["rows"][0][1], "Alice")
+        result = asyncio.run(run_select_query(query))
+        self.assertIsInstance(result, str)
+        data = json.loads(result)
+        self.assertEqual(len(data["rows"]), 2)
+        self.assertEqual(data["rows"][0][0], 1)
+        self.assertEqual(data["rows"][0][1], "Alice")
 
     def test_run_select_query_failure(self):
-        """Test running a SELECT query with an error."""
+        """Test running a SELECT query with an error (raises ToolError)."""
+        import asyncio
+        from fastmcp.exceptions import ToolError
         query = f"SELECT * FROM {self.test_db}.non_existent_table"
-        result = run_select_query.fn(query)
-        self.assertIsInstance(result, dict)
-        self.assertEqual(result["status"], "error")
-        self.assertIn("Query failed", result["message"])
+        with self.assertRaises(ToolError):
+            asyncio.run(run_select_query(query))
 
     def test_table_and_column_comments(self):
         """Test that table and column comments are correctly retrieved."""
-        result = list_tables.fn(self.test_db)
-        self.assertIsInstance(result, list)
-        self.assertEqual(len(result), 1)
+        result = list_tables(self.test_db)
+        self.assertIsInstance(result, str)
+        tables = json.loads(result)
+        self.assertEqual(len(tables), 1)
 
-        table_info = result[0]
+        table_info = tables[0]
         # Verify table comment
         self.assertEqual(table_info["comment"], "Test table for unit testing")
 

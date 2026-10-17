@@ -444,7 +444,7 @@ def _create_clickhouse_client(client_config: dict):
     )
 
     try:
-        client = clickhouse_connect.get_client(**client_config)
+        client = clickhouse_connect.get_client(autogenerate_session_id=False, **client_config)
         # Test the connection
         version = client.server_version
         logger.info(f"Successfully connected to ClickHouse server version {version}")

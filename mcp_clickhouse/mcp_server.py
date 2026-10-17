@@ -199,26 +199,6 @@ def _serialize_tool_result(obj: Any) -> str:
     """Serialize a tool result to a JSON string (unified contract from 6e04286)."""
     return json.dumps(_stringify_unsafe_integers(obj), default=str)
 
-# --- Tool result serialization (ported from 6e04286 + 82f0d12) -------------
-# MCP protocol requires tool results to be strings. Large integers outside
-# JavaScript's safe range are stringified to avoid precision corruption.
-_JS_MAX_SAFE_INTEGER = 9007199254740991
-
-def _stringify_unsafe_integers(obj: Any) -> Any:
-    """Convert ints outside the JS safe range to strings (82f0d12), simply."""
-    if isinstance(obj, bool):
-        return obj
-    if isinstance(obj, int):
-        return str(obj) if abs(obj) > _JS_MAX_SAFE_INTEGER else obj
-    if isinstance(obj, dict):
-        return {k: _stringify_unsafe_integers(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_stringify_unsafe_integers(v) for v in obj]
-    return obj
-
-def _serialize_tool_result(obj: Any) -> str:
-    """Serialize a tool result to a JSON string (unified contract from 6e04286)."""
-    return json.dumps(_stringify_unsafe_integers(obj), default=str)
 
 
 @mcp.tool()

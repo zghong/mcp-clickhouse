@@ -1,15 +1,18 @@
 import logging
+import asyncio
 import json
-from typing import Optional, List, Any
+import uuid
+from typing import Optional, List, Any, Dict
 import concurrent.futures
 import atexit
 
 import clickhouse_connect
-from clickhouse_connect.driver.binding import format_query_value
+from clickhouse_connect.driver.binding import format_query_value, external_bind_re
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
-from dataclasses import dataclass, field, asdict, is_dataclass
+from dataclasses import dataclass, field, asdict
 
 from mcp_clickhouse.mcp_env import get_config, get_mcp_config, TransportType
 
@@ -61,7 +64,6 @@ logger = logging.getLogger(MCP_SERVER_NAME)
 
 QUERY_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 atexit.register(lambda: QUERY_EXECUTOR.shutdown(wait=True))
-SELECT_QUERY_TIMEOUT_SECS = 30
 
 load_dotenv()
 
@@ -100,14 +102,47 @@ def result_to_column(query_columns, result) -> List[Column]:
     return [Column(**dict(zip(query_columns, row))) for row in result]
 
 
-def to_json(obj: Any) -> str:
-    if is_dataclass(obj):
-        return json.dumps(asdict(obj), default=to_json)
-    elif isinstance(obj, list):
-        return [to_json(item) for item in obj]
-    elif isinstance(obj, dict):
-        return {key: to_json(value) for key, value in obj.items()}
+# --- Tool result serialization (ported from 6e04286 + 82f0d12) -------------
+# MCP protocol requires tool results to be strings. Large integers outside
+# JavaScript's safe range are stringified to avoid precision corruption.
+_JS_MAX_SAFE_INTEGER = 9007199254740991
+
+def _stringify_unsafe_integers(obj: Any) -> Any:
+    """Convert ints outside the JS safe range to strings (82f0d12), simply."""
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, int):
+        return str(obj) if abs(obj) > _JS_MAX_SAFE_INTEGER else obj
+    if isinstance(obj, dict):
+        return {k: _stringify_unsafe_integers(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_stringify_unsafe_integers(v) for v in obj]
     return obj
+
+def _serialize_tool_result(obj: Any) -> str:
+    """Serialize a tool result to a JSON string (unified contract from 6e04286)."""
+    return json.dumps(_stringify_unsafe_integers(obj), default=str)
+
+# --- Tool result serialization (ported from 6e04286 + 82f0d12) -------------
+# MCP protocol requires tool results to be strings. Large integers outside
+# JavaScript's safe range are stringified to avoid precision corruption.
+_JS_MAX_SAFE_INTEGER = 9007199254740991
+
+def _stringify_unsafe_integers(obj: Any) -> Any:
+    """Convert ints outside the JS safe range to strings (82f0d12), simply."""
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, int):
+        return str(obj) if abs(obj) > _JS_MAX_SAFE_INTEGER else obj
+    if isinstance(obj, dict):
+        return {k: _stringify_unsafe_integers(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_stringify_unsafe_integers(v) for v in obj]
+    return obj
+
+def _serialize_tool_result(obj: Any) -> str:
+    """Serialize a tool result to a JSON string (unified contract from 6e04286)."""
+    return json.dumps(_stringify_unsafe_integers(obj), default=str)
 
 
 @mcp.tool()
@@ -157,55 +192,81 @@ def list_tables(database: str, like: Optional[str] = None, not_like: Optional[st
         ]
 
     logger.info(f"Found {len(tables)} tables")
-    return [asdict(table) for table in tables]
+    # Unified string return contract (6e04286)
+    return _serialize_tool_result([asdict(table) for table in tables])
 
 
-def execute_query(query: str):
+def execute_query(query: str, params: Optional[Dict[str, Any]] = None, query_id: Optional[str] = None):
+    """Execute a query in a worker thread (off the event loop, cb75c27)."""
     client = create_clickhouse_client()
-    try:
-        read_only = get_readonly_setting(client)
-        res = client.query(query, settings={"readonly": read_only})
-        logger.info(f"Query returned {len(res.result_rows)} rows")
-        return {"columns": res.column_names, "rows": res.result_rows}
-    except Exception as err:
-        logger.error(f"Error executing query: {err}")
-        # Return a structured dictionary rather than a string to ensure proper serialization
-        # by the MCP protocol. String responses for errors can cause BrokenResourceError.
-        return {"error": str(err)}
+    read_only = get_readonly_setting(client)
+    settings = {"readonly": read_only}
+    if query_id:
+        # Attach a server-side query_id so the query can be cancelled (0893019)
+        settings["query_id"] = query_id
+    res = client.query(query, parameters=params, settings=settings)
+    logger.info(f"Query returned {len(res.result_rows)} rows")
+    return {"columns": res.column_names, "rows": res.result_rows}
 
+def _cancel_query(query_id: str) -> None:
+    """Best-effort server-side KILL QUERY for an in-flight query (0893019)."""
+    try:
+        client = create_clickhouse_client()
+        client.command(f"KILL QUERY WHERE query_id = {format_query_value(query_id)}")
+        logger.info(f"Successfully cancelled query {query_id}")
+    except Exception as e:
+        logger.warning(f"Failed to cancel query {query_id}: {e}")
 
 @mcp.tool()
-def run_select_query(query: str):
-    """Run a SELECT query in a ClickHouse database"""
+async def run_select_query(query: str, params: Optional[Dict[str, Any]] = None) -> str:
+    """Run a SELECT query in a ClickHouse database.
+
+    Bind params by name with ClickHouse placeholders such as {name:String}
+    (native parameter binding from 1cf9ab6). Values may be JSON scalars,
+    nulls, or arrays; pass exact large integers as decimal strings.
+    """
     logger.info(f"Executing SELECT query: {query}")
+    # Native {name:Type} placeholder binding only (1cf9ab6): keep parameters
+    # out of client-side string formatting and raw binary paths.
+    if params is not None:
+        if not isinstance(params, dict) or any(not isinstance(k, str) for k in params):
+            raise ToolError("params must be an object with string keys")
+        if params and external_bind_re.search(query) is None:
+            raise ToolError(
+                "params requires ClickHouse {name:Type} placeholders, for example {id:UInt32}. "
+                "Python percent formatting and $name$ raw binary parameters are not supported."
+            )
+
+    timeout_secs = get_mcp_config().query_timeout
+    query_id = str(uuid.uuid4())
+    future = None
     try:
-        future = QUERY_EXECUTOR.submit(execute_query, query)
-        try:
-            result = future.result(timeout=SELECT_QUERY_TIMEOUT_SECS)
-            # Check if we received an error structure from execute_query
-            if isinstance(result, dict) and "error" in result:
-                logger.warning(f"Query failed: {result['error']}")
-                # MCP requires structured responses; string error messages can cause
-                # serialization issues leading to BrokenResourceError
-                return {
-                    "status": "error",
-                    "message": f"Query failed: {result['error']}",
-                }
-            return result
-        except concurrent.futures.TimeoutError:
-            logger.warning(f"Query timed out after {SELECT_QUERY_TIMEOUT_SECS} seconds: {query}")
-            future.cancel()
-            # Return a properly structured response for timeout errors
-            return {
-                "status": "error",
-                "message": f"Query timed out after {SELECT_QUERY_TIMEOUT_SECS} seconds",
-            }
+        # Await the worker-pool future asynchronously so the event loop keeps
+        # serving other tool calls while a slow query runs (cb75c27).
+        future = QUERY_EXECUTOR.submit(execute_query, query, params, query_id)
+        result = await asyncio.wait_for(asyncio.wrap_future(future), timeout=timeout_secs)
+        return _serialize_tool_result(result)
+    except concurrent.futures.TimeoutError:
+        logger.warning(f"Query timed out after {timeout_secs} seconds: {query}")
+        future.cancel()
+        raise ToolError(f"Query timed out after {timeout_secs} seconds")
+    except asyncio.TimeoutError:
+        logger.warning(f"Query timed out after {timeout_secs} seconds: {query}")
+        if not future.cancel():
+            # Already running: issue a server-side KILL QUERY (0893019)
+            await asyncio.to_thread(_cancel_query, query_id)
+        raise ToolError(f"Query timed out after {timeout_secs} seconds")
+    except asyncio.CancelledError:
+        # Client cancelled the tool call: cancel the future, and if it is
+        # already running, issue a server-side KILL QUERY (0893019).
+        if not future.cancel():
+            await asyncio.to_thread(_cancel_query, query_id)
+        raise
+    except ToolError:
+        raise
     except Exception as e:
         logger.error(f"Unexpected error in run_select_query: {str(e)}")
-        # Catch all other exceptions and return them in a structured format
-        # to prevent MCP serialization failures
-        return {"status": "error", "message": f"Unexpected error: {str(e)}"}
-
+        raise ToolError(f"Unexpected error during query execution: {str(e)}")
 
 def _connection_error_hints(error: Exception, client_config: dict) -> List[str]:
     """Return actionable hints for common ClickHouse connection misconfigurations.

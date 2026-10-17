@@ -50,6 +50,7 @@ class ClickHouseConfig:
             CLICKHOUSE_MCP_AUTH_DISABLED=true)
         CLICKHOUSE_MCP_AUTH_DISABLED: Disable authentication for HTTP/SSE (default: false,
             only for development)
+        CLICKHOUSE_MCP_QUERY_TIMEOUT: SELECT tool timeout in seconds (default: 30)
     """
 
     def __init__(self):
@@ -161,6 +162,11 @@ class ClickHouseConfig:
     def auth_disabled(self) -> bool:
         """Whether HTTP/SSE authentication is disabled (development only)."""
         return os.getenv("CLICKHOUSE_MCP_AUTH_DISABLED", "false").lower() == "true"
+
+    @property
+    def query_timeout(self) -> int:
+        """Timeout in seconds for the run_select_query tool (9f91105)."""
+        return int(os.getenv("CLICKHOUSE_MCP_QUERY_TIMEOUT", "30"))
 
     def get_client_config(self) -> dict:
         """Get the configuration dictionary for clickhouse_connect client.

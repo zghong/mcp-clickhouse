@@ -8,9 +8,10 @@ import clickhouse_connect
 from clickhouse_connect.driver.binding import format_query_value
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from dataclasses import dataclass, field, asdict, is_dataclass
 
-from mcp_clickhouse.mcp_env import get_config
+from mcp_clickhouse.mcp_env import get_config, get_mcp_config, TransportType
 
 
 @dataclass
@@ -47,6 +48,11 @@ class Table:
 
 MCP_SERVER_NAME = "mcp-clickhouse"
 
+# ClickHouse native TCP protocol ports (clickhouse-client). This server uses the
+# HTTP interface only (default 8123/8443); connecting to native ports fails with
+# messages like "Port 9000 is for clickhouse-client program" (from 423ca2e).
+_NATIVE_PROTOCOL_PORTS = frozenset({9000, 9440})
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -59,7 +65,31 @@ SELECT_QUERY_TIMEOUT_SECS = 30
 
 load_dotenv()
 
-mcp = FastMCP(name=MCP_SERVER_NAME)
+# Configure authentication for HTTP/SSE transports (from a1f3639).
+# A single static bearer token keeps the implementation simple; OAuth/JWT
+# providers from upstream are intentionally not ported.
+auth_provider = None
+mcp_config = get_mcp_config()
+http_transports = [TransportType.HTTP.value, TransportType.SSE.value]
+
+if mcp_config.mcp_server_transport in http_transports:
+    if mcp_config.auth_disabled:
+        logger.warning("WARNING: MCP SERVER AUTHENTICATION IS DISABLED")
+        logger.warning("Only use this for local development/testing. DO NOT expose to networks.")
+    elif mcp_config.auth_token:
+        auth_provider = StaticTokenVerifier(
+            tokens={mcp_config.auth_token: {"client_id": "mcp-client", "scopes": []}},
+            required_scopes=[],
+        )
+        logger.info("Authentication enabled for HTTP/SSE transport")
+    else:
+        raise ValueError(
+            "Authentication token required for HTTP/SSE transports. "
+            "Set CLICKHOUSE_MCP_AUTH_TOKEN environment variable or set "
+            "CLICKHOUSE_MCP_AUTH_DISABLED=true (for development only)."
+        )
+
+mcp = FastMCP(name=MCP_SERVER_NAME, auth=auth_provider)
 
 
 def result_to_table(query_columns, result) -> List[Table]:
@@ -177,6 +207,83 @@ def run_select_query(query: str):
         return {"status": "error", "message": f"Unexpected error: {str(e)}"}
 
 
+def _connection_error_hints(error: Exception, client_config: dict) -> List[str]:
+    """Return actionable hints for common ClickHouse connection misconfigurations.
+
+    Ported from 423ca2e: helps users who confuse MCP transport settings with
+    database settings, or who point CLICKHOUSE_PORT at the native TCP protocol.
+    """
+    hints: List[str] = []
+    err = str(error).lower()
+    port = client_config.get("port")
+    secure = bool(client_config.get("secure"))
+    host = client_config.get("host", "<unknown>")
+
+    native_response_port = next(
+        (
+            native_port
+            for native_port in _NATIVE_PROTOCOL_PORTS
+            if f"port {native_port} is for clickhouse-client" in err
+        ),
+        None,
+    )
+    if port in _NATIVE_PROTOCOL_PORTS:
+        hints.append(
+            f"CLICKHOUSE_PORT={port} looks like ClickHouse's native TCP protocol port "
+            "(used by clickhouse-client). This server uses the HTTP interface — set "
+            "CLICKHOUSE_PORT to 8123 (HTTP) or 8443 (HTTPS), or your deployment's HTTP "
+            "mapping. Do not use native ports 9000/9440."
+        )
+    elif native_response_port is not None:
+        hints.append(
+            f"The ClickHouse response indicates that this request reached native TCP port "
+            f"{native_response_port}, even though the client was configured for {host}:{port}. "
+            "Check DNS, service, proxy, load-balancer, and port mappings to ensure traffic is "
+            "routed to ClickHouse's HTTP interface (8123/8443 by default)."
+        )
+
+    tls_tokens = (
+        "ssl", "tls", "certificate", "handshake", "wrong version number",
+        "certificate verify failed", "unexpected_eof",
+        "eof occurred in violation of protocol",
+    )
+    if any(token in err for token in tls_tokens):
+        scheme = "HTTPS" if secure else "HTTP"
+        hints.append(
+            f"TLS/SSL error while connecting with CLICKHOUSE_SECURE="
+            f"{str(secure).lower()} ({scheme} to {host}:{port}). "
+            "CLICKHOUSE_SECURE enables HTTPS for the ClickHouse database connection "
+            "only — it is not MCP or ingress TLS. Use true for HTTPS database "
+            "endpoints (port 8443) and false only for plain HTTP (typical local "
+            "Docker on 8123)."
+        )
+
+    # General connectivity failures can surface as opaque HTTP errors.
+    connection_failure_tokens = (
+        "http status", "bad status line", "connection refused",
+        "connection reset", "remote end closed connection",
+    )
+    if any(token in err for token in connection_failure_tokens) and not hints:
+        hints.append(
+            f"Connection to {host}:{port} failed. Verify ClickHouse is running and reachable "
+            "at this address and that network or proxy routing permits access. Then confirm "
+            f"CLICKHOUSE_SECURE={str(secure).lower()} matches whether ClickHouse expects HTTPS, "
+            "and that CLICKHOUSE_PORT is an HTTP interface port (8123/8443), not a native TCP "
+            "port (9000/9440)."
+        )
+
+    return hints
+
+
+def _format_connection_failure(error: Exception, client_config: dict) -> str:
+    """Build a connection failure message with optional configuration hints."""
+    message = f"Failed to connect to ClickHouse: {error}"
+    hints = _connection_error_hints(error, client_config)
+    if hints:
+        message += "\n" + "\n".join(f"Hint: {hint}" for hint in hints)
+    return message
+
+
 def create_clickhouse_client():
     client_config = get_config().get_client_config()
     logger.info(
@@ -194,7 +301,9 @@ def create_clickhouse_client():
         logger.info(f"Successfully connected to ClickHouse server version {version}")
         return client
     except Exception as e:
-        logger.error(f"Failed to connect to ClickHouse: {str(e)}")
+        # Attach actionable configuration hints to connection failures (423ca2e)
+        message = _format_connection_failure(e, client_config)
+        logger.error(message)
         raise
 
 

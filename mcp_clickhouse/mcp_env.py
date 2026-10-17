@@ -5,8 +5,22 @@ and type conversion.
 """
 
 from dataclasses import dataclass
+from enum import Enum
 import os
 from typing import Optional
+
+
+class TransportType(str, Enum):
+    """Supported MCP server transport types."""
+
+    STDIO = "stdio"
+    HTTP = "http"
+    SSE = "sse"
+
+    @classmethod
+    def values(cls) -> list[str]:
+        """Get all valid transport values."""
+        return [transport.value for transport in cls]
 
 
 @dataclass
@@ -30,6 +44,12 @@ class ClickHouseConfig:
         CLICKHOUSE_DATABASE: Default database to use (default: None)
         CLICKHOUSE_PROXY_PATH: Path to be added to the host URL. For instance, for servers behind an HTTP proxy (default: None)
         CLICKHOUSE_MCP_SERVER_TRANSPORT: MCP server transport method - "stdio", "http", or "sse" (default: stdio)
+        CLICKHOUSE_MCP_BIND_HOST: Bind host for HTTP/SSE (default: 127.0.0.1)
+        CLICKHOUSE_MCP_BIND_PORT: Bind port for HTTP/SSE (default: 8000)
+        CLICKHOUSE_MCP_AUTH_TOKEN: Bearer token for HTTP/SSE transports (required unless
+            CLICKHOUSE_MCP_AUTH_DISABLED=true)
+        CLICKHOUSE_MCP_AUTH_DISABLED: Disable authentication for HTTP/SSE (default: false,
+            only for development)
     """
 
     def __init__(self):
@@ -110,13 +130,37 @@ class ClickHouseConfig:
         Valid options: "stdio", "http", "sse"
         Default: "stdio"
         """
-        transport = os.getenv("CLICKHOUSE_MCP_SERVER_TRANSPORT", "stdio").lower()
-        valid_transports = "stdio", "http", "streamable-http", "sse"
-        if transport not in valid_transports:
-            raise ValueError(
-                f"Invalid transport '{transport}'. Valid options: {', '.join(valid_transports)}"
-            )
+        transport = os.getenv("CLICKHOUSE_MCP_SERVER_TRANSPORT", TransportType.STDIO.value).lower()
+        if transport not in TransportType.values():
+            valid_options = ", ".join(f'"{t}"' for t in TransportType.values())
+            raise ValueError(f"Invalid transport '{transport}'. Valid options: {valid_options}")
         return transport
+
+    @property
+    def mcp_bind_host(self) -> str:
+        """Host to bind the MCP server to when using HTTP/SSE transport.
+
+        Default: "127.0.0.1"
+        """
+        return os.getenv("CLICKHOUSE_MCP_BIND_HOST", "127.0.0.1")
+
+    @property
+    def mcp_bind_port(self) -> int:
+        """Port to bind the MCP server to when using HTTP/SSE transport.
+
+        Default: 8000
+        """
+        return int(os.getenv("CLICKHOUSE_MCP_BIND_PORT", "8000"))
+
+    @property
+    def auth_token(self) -> Optional[str]:
+        """Bearer token required for HTTP/SSE transports."""
+        return os.getenv("CLICKHOUSE_MCP_AUTH_TOKEN")
+
+    @property
+    def auth_disabled(self) -> bool:
+        """Whether HTTP/SSE authentication is disabled (development only)."""
+        return os.getenv("CLICKHOUSE_MCP_AUTH_DISABLED", "false").lower() == "true"
 
     def get_client_config(self) -> dict:
         """Get the configuration dictionary for clickhouse_connect client.
@@ -129,6 +173,9 @@ class ClickHouseConfig:
             "port": self.port,
             "username": self.username,
             "password": self.password,
+            # Explicitly derive the HTTP interface from the secure flag so the
+            # driver never has to guess between http/https (2c96c64).
+            "interface": "https" if self.secure else "http",
             "secure": self.secure,
             "verify": self.verify,
             "connect_timeout": self.connect_timeout,
@@ -174,3 +221,10 @@ def get_config():
         # Instantiate the config object here, ensuring load_dotenv() has likely run
         _CONFIG_INSTANCE = ClickHouseConfig()
     return _CONFIG_INSTANCE
+
+# Global instance placeholder for the MCP server config singleton
+_MCP_CONFIG_INSTANCE = None
+
+def get_mcp_config():
+    """Gets the singleton instance of the same ClickHouseConfig (MCP-server-side settings)."""
+    return get_config()

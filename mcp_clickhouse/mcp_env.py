@@ -235,6 +235,7 @@ def get_mcp_config():
     """Gets the singleton instance of the same ClickHouseConfig (MCP-server-side settings)."""
     return get_config()
 
+
 class ClusterUnspecifiedMode(str, Enum):
     """How tools should behave when no cluster_name is given."""
 
@@ -244,6 +245,7 @@ class ClusterUnspecifiedMode(str, Enum):
     @classmethod
     def values(cls) -> list[str]:
         return [mode.value for mode in cls]
+
 
 @dataclass
 class ClusterRegistryConfig:
@@ -276,7 +278,9 @@ class ClusterRegistryConfig:
             raise ValueError(f"Invalid CLICKHOUSE_CLUSTER_UNSPECIFIED_MODE '{mode}'. Valid options: {valid_options}")
         return mode
 
+
 _CLUSTER_REGISTRY_CONFIG_INSTANCE = None
+
 
 def get_cluster_registry_config() -> ClusterRegistryConfig:
     """Gets the singleton instance of ClusterRegistryConfig."""

@@ -140,23 +140,26 @@ class ClusterRegistry:
             self._clusters_by_name = clusters_by_name
         logger.info("Loaded %d ClickHouse clusters from adminserver", len(clusters))
 
-    def get_cluster_by_name(self, name: str) -> Optional[ClusterInfo]:
-        """Look up a cluster by name, supporting fuzzy matching on shorthand names.
+    def get_cluster_by_name(self, name: str) -> Optional[List[ClusterInfo]]:
+        """Look up clusters by name, supporting fuzzy matching on shorthand names.
 
         Resolution order:
-        1. Exact match on the full cluster name.
+        1. Exact match on the full cluster name (returns a single-element list).
         2. Regex-based fuzzy match for shorthand names of the form
            ``prefix + (pub|ts|nfs) + number`` (e.g. ``foopub01``), which are
            matched against ``prefix(cn)?_?type?_?number$`` case-insensitively.
 
-        Raises:
-            ValueError: if the fuzzy match resolves to multiple clusters.
+        Returns:
+            - None if no cluster matches.
+            - A list with exactly one ClusterInfo on an unambiguous match.
+            - A list with multiple ClusterInfo when a fuzzy pattern matches several
+              clusters; the caller is responsible for disambiguation.
         """
         with self._lock:
             # 1. Exact match (for full cluster names).
             cluster = self._clusters_by_name.get(name)
             if cluster is not None:
-                return cluster
+                return [cluster]
 
             clusters = list(self._clusters_by_name.values())
 
@@ -173,14 +176,10 @@ class ClusterRegistry:
         except re.error:
             return None
 
-        matched = [c for c in clusters if compiled.match(c.name)]
+        matched = [c for c in clusters if compiled.search(c.name)]
         if not matched:
             return None
-        if len(matched) == 1:
-            return matched[0]
-
-        cluster_names = ", ".join(c.name for c in matched)
-        raise ValueError(f"Cluster is not unique: {cluster_names}")
+        return matched
 
     def get_all_clusters(self) -> List[ClusterInfo]:
         with self._lock:

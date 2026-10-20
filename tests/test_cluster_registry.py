@@ -99,8 +99,8 @@ class TestClusterRegistry:
         with patch("mcp_clickhouse.utils_clusters._fetch_clusters_from_adminserver", return_value=clusters):
             registry.load()
 
-        assert registry.get_cluster_by_name("cluster-a").owner == "alice"
-        assert registry.get_cluster_by_name("cluster-b").owner == "bob"
+        assert registry.get_cluster_by_name("cluster-a")[0].owner == "alice"
+        assert registry.get_cluster_by_name("cluster-b")[0].owner == "bob"
         assert registry.get_cluster_by_name("cluster-missing") is None
         assert {c.name for c in registry.get_all_clusters()} == {"cluster-a", "cluster-b"}
 
@@ -113,7 +113,7 @@ class TestClusterRegistry:
 
         # Even though the shorthand "foopub01" would fuzzy-match "foo_pub_01",
         # an exact match on the full name must win.
-        assert registry.get_cluster_by_name("foopub01").name == "foopub01"
+        assert registry.get_cluster_by_name("foopub01")[0].name == "foopub01"
 
     def test_get_cluster_by_name_fuzzy_matches_shorthand(self):
         registry = ClusterRegistry()
@@ -123,8 +123,8 @@ class TestClusterRegistry:
             registry.load()
 
         # Shorthand names resolve to the full cluster name via regex.
-        assert registry.get_cluster_by_name("foopub01").name == "foo_pub_01"
-        assert registry.get_cluster_by_name("barts2").name == "bar_ts_2"
+        assert registry.get_cluster_by_name("foopub01")[0].name == "foo_pub_01"
+        assert registry.get_cluster_by_name("barts2")[0].name == "bar_ts_2"
 
     def test_get_cluster_by_name_fuzzy_matches_cn_variant(self):
         registry = ClusterRegistry()
@@ -134,7 +134,7 @@ class TestClusterRegistry:
             registry.load()
 
         # The optional "cn" segment is matched by the fuzzy pattern.
-        assert registry.get_cluster_by_name("foopub01").name == "foocn_pub_01"
+        assert registry.get_cluster_by_name("foopub01")[0].name == "foocn_pub_01"
 
     def test_get_cluster_by_name_is_case_insensitive(self):
         registry = ClusterRegistry()
@@ -143,7 +143,7 @@ class TestClusterRegistry:
         with patch("mcp_clickhouse.utils_clusters._fetch_clusters_from_adminserver", return_value=clusters):
             registry.load()
 
-        assert registry.get_cluster_by_name("FOOPUB01").name == "foo_pub_01"
+        assert registry.get_cluster_by_name("FOOPUB01")[0].name == "foo_pub_01"
 
     def test_get_cluster_by_name_no_match_returns_none(self):
         registry = ClusterRegistry()
@@ -157,15 +157,18 @@ class TestClusterRegistry:
         # name resolves to nothing either.
         assert registry.get_cluster_by_name("unknown-cluster") is None
 
-    def test_get_cluster_by_name_ambiguous_match_raises(self):
+    def test_get_cluster_by_name_ambiguous_match_returns_multiple(self):
         registry = ClusterRegistry()
         clusters = [_make_cluster("foo_pub_01"), _make_cluster("foo_pub01")]
 
         with patch("mcp_clickhouse.utils_clusters._fetch_clusters_from_adminserver", return_value=clusters):
             registry.load()
 
-        with pytest.raises(ValueError, match="Cluster is not unique"):
-            registry.get_cluster_by_name("foopub01")
+        # A fuzzy shorthand that matches several clusters now returns all of them;
+        # the caller is responsible for disambiguation.
+        matched = registry.get_cluster_by_name("foopub01")
+        assert matched is not None
+        assert {c.name for c in matched} == {"foo_pub_01", "foo_pub01"}
 
     def test_load_failure_propagates_and_keeps_index_empty(self):
         registry = ClusterRegistry()
@@ -247,7 +250,7 @@ class TestCreateClickhouseClientWithClusterName:
     def test_known_cluster_name_uses_cluster_config(self, mock_cc, mock_get_registry):
         cluster = _make_cluster("cluster-a", "alice")
         mock_registry = MagicMock()
-        mock_registry.get_cluster_by_name.return_value = cluster
+        mock_registry.get_cluster_by_name.return_value = [cluster]
         mock_get_registry.return_value = mock_registry
         mock_cc.get_client.return_value = MagicMock(server_version="23.8")
 
@@ -268,6 +271,18 @@ class TestCreateClickhouseClientWithClusterName:
 
         with pytest.raises(ToolError):
             create_clickhouse_client(cluster_name="does-not-exist")
+
+    @patch("mcp_clickhouse.mcp_server.get_cluster_registry")
+    def test_ambiguous_cluster_name_raises_tool_error(self, mock_get_registry):
+        mock_registry = MagicMock()
+        mock_registry.get_cluster_by_name.return_value = [
+            _make_cluster("foo_pub_01"),
+            _make_cluster("foo_pub01"),
+        ]
+        mock_get_registry.return_value = mock_registry
+
+        with pytest.raises(ToolError, match="ambiguous"):
+            create_clickhouse_client(cluster_name="foopub01")
 
     @patch("mcp_clickhouse.mcp_server.clickhouse_connect")
     def test_no_cluster_name_uses_default_config(self, mock_cc):
@@ -308,14 +323,25 @@ class TestListClustersTool:
     def test_filters_by_name(self, mock_get_registry):
         cluster = _make_cluster("cluster-a", "alice")
         mock_registry = MagicMock()
-        mock_registry.get_cluster_by_name.return_value = cluster
+        mock_registry.get_cluster_by_name.return_value = [cluster]
         mock_get_registry.return_value = mock_registry
 
-        result = json.loads(list_clusters(name="cluster-a"))
+        result = json.loads(list_clusters(cluster_name="cluster-a", verbose=True))
 
         assert len(result) == 1
         assert result[0]["name"] == "cluster-a"
         assert "admin_password" not in result[0]
+
+    @patch("mcp_clickhouse.mcp_server.get_cluster_registry")
+    def test_filters_by_name_returns_names_by_default(self, mock_get_registry):
+        cluster = _make_cluster("cluster-a", "alice")
+        mock_registry = MagicMock()
+        mock_registry.get_cluster_by_name.return_value = [cluster]
+        mock_get_registry.return_value = mock_registry
+
+        result = json.loads(list_clusters(cluster_name="cluster-a"))
+
+        assert result == ["cluster-a"]
 
     @patch("mcp_clickhouse.mcp_server.get_cluster_registry")
     def test_no_filter_returns_all(self, mock_get_registry):
@@ -329,7 +355,7 @@ class TestListClustersTool:
         result = json.loads(list_clusters())
 
         mock_registry.get_all_clusters.assert_called_once()
-        assert len(result) == 2
+        assert result == ["cluster-a", "cluster-b"]
 
     @patch("mcp_clickhouse.mcp_server.get_cluster_registry")
     def test_unknown_name_returns_empty_list(self, mock_get_registry):
@@ -337,6 +363,6 @@ class TestListClustersTool:
         mock_registry.get_cluster_by_name.return_value = None
         mock_get_registry.return_value = mock_registry
 
-        result = json.loads(list_clusters(name="does-not-exist"))
+        result = json.loads(list_clusters(cluster_name="does-not-exist"))
 
         assert result == []

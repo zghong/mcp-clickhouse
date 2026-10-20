@@ -238,40 +238,51 @@ def _check_cluster_specified(cluster_name: Optional[str]) -> None:
 
     if cluster_registry_config.unspecified_mode == ClusterUnspecifiedMode.PROMPT.value:
         raise ToolError(
-            "No cluster_name specified. This server has multiple ClickHouse clusters "
-            "registered — call list_clusters to discover available clusters, then pass "
-            "cluster_name to this tool. Set CLICKHOUSE_CLUSTER_UNSPECIFIED_MODE=fallback "
-            "to default to CLICKHOUSE_HOST instead when cluster_name is omitted."
+            "STOP. No cluster_name specified. This server has multiple ClickHouse clusters "
+            "registered, so it is ambiguous which one to use. Do NOT guess and MUST ask the "
+            "user directly for the right cluster name they want to operate on. Or set "
+            "CLICKHOUSE_CLUSTER_UNSPECIFIED_MODE=fallback to default to CLICKHOUSE_HOST "
+            "instead when cluster_name is omitted."
         )
 
-def list_clusters(name: Optional[str] = None) -> str:
+def list_clusters(
+    cluster_name: Optional[str] = None,
+    verbose: bool = False,
+) -> str:
     """List ClickHouse clusters registered in the adminserver cluster registry.
 
-    Use this to discover the cluster_name values accepted by other tools
-    (list_databases, list_tables, run_select_query). Only available when
-    CLICKHOUSE_CLUSTER_REGISTRY_ENABLED=true.
+    RESTRICTED TOOL — read this before calling:
+      - Only call this tool when the user EXPLICITLY asks to list/enumerate/discover clusters.
+      - Do NOT call this tool to guess or resolve a cluster after another tool
+        returned an "Unknown cluster" / "ambiguous cluster" error. In that case you
+        MUST ask the user directly for the exact cluster name instead.
+      - Only available when CLICKHOUSE_CLUSTER_REGISTRY_ENABLED=true.
 
     Args:
-        name: Return only the cluster with this exact name, if any
+        cluster_name: Return only the cluster with this exact name, if any.
+        verbose: When False (default), return only lightweight cluster names to keep
+            the payload small. When True, return full metadata for each cluster.
     """
     registry = get_cluster_registry()
-    if name:
-        cluster = registry.get_cluster_by_name(name)
-        clusters = [cluster] if cluster else []
+    if cluster_name:
+        clusters = registry.get_cluster_by_name(cluster_name) or []
     else:
         clusters = registry.get_all_clusters()
 
-    logger.info("Listing clusters (name=%s): %d found", name, len(clusters))
-    return _serialize_tool_result([cluster.to_public_dict() for cluster in clusters])
+    if verbose:
+        items: Any = [cluster.to_public_dict() for cluster in clusters]
+    else:
+        items = [cluster.name for cluster in clusters]
+
+    return _serialize_tool_result(items)
 
 @mcp.tool()
 def list_databases(cluster_name: Optional[str] = None) -> str:
     """List available ClickHouse databases
 
     Args:
-        cluster_name: Name of a registered ClickHouse cluster to query (see
-            list_clusters). If omitted, uses the default cluster configured via
-            CLICKHOUSE_HOST.
+        cluster_name: Name of a registered ClickHouse cluster to query. If omitted,
+            uses the default cluster configured via CLICKHOUSE_HOST.
     """
     _check_cluster_specified(cluster_name)
     logger.info(f"Listing all databases (cluster_name={cluster_name})")
@@ -297,9 +308,8 @@ def list_tables(database: str, like: Optional[str] = None, not_like: Optional[st
         database: The database to list tables from
         like: Optional LIKE pattern to filter table names
         not_like: Optional NOT LIKE pattern to exclude table names
-        cluster_name: Name of a registered ClickHouse cluster to query (see
-            list_clusters). If omitted, uses the default cluster configured via
-            CLICKHOUSE_HOST.
+        cluster_name: Name of a registered ClickHouse cluster to query. If omitted,
+            uses the default cluster configured via CLICKHOUSE_HOST.
     """
     _check_cluster_specified(cluster_name)
     logger.info(
@@ -541,13 +551,22 @@ def create_clickhouse_client(cluster_name: Optional[str] = None):
     cluster registry instead of the default CLICKHOUSE_HOST cluster.
     """
     if cluster_name:
-        cluster = get_cluster_registry().get_cluster_by_name(cluster_name)
-        if cluster is None:
+        clusters = get_cluster_registry().get_cluster_by_name(cluster_name)
+        if not clusters:
             raise ToolError(
-                f"Unknown ClickHouse cluster '{cluster_name}'. Call list_clusters to see "
-                "available clusters."
+                f"STOP. Unknown ClickHouse cluster '{cluster_name}'. Do NOT guess and "
+                "MUST ask the user directly for the right cluster name they want to "
+                "operate on, then retry this tool with that name."
             )
-        client_config = cluster.get_client_config()
+        if len(clusters) > 1:
+            matched_names = ", ".join(c.name for c in clusters)
+            raise ToolError(
+                f"STOP. The cluster name '{cluster_name}' is ambiguous and matches multiple "
+                f"clusters: {matched_names}. Do NOT guess and MUST ask the user directly for "
+                f"the right cluster name they want to operate on, then retry this tool with "
+                f"that name."
+            )
+        client_config = clusters[0].get_client_config()
     else:
         client_config = get_config().get_client_config()
     key = _client_cache_key(client_config)

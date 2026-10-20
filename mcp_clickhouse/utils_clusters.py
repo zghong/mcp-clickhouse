@@ -5,6 +5,7 @@ only the single host configured via CLICKHOUSE_HOST.
 """
 
 import logging
+import re
 import threading
 from dataclasses import asdict, dataclass
 from typing import List, Optional
@@ -140,8 +141,46 @@ class ClusterRegistry:
         logger.info("Loaded %d ClickHouse clusters from adminserver", len(clusters))
 
     def get_cluster_by_name(self, name: str) -> Optional[ClusterInfo]:
+        """Look up a cluster by name, supporting fuzzy matching on shorthand names.
+
+        Resolution order:
+        1. Exact match on the full cluster name.
+        2. Regex-based fuzzy match for shorthand names of the form
+           ``prefix + (pub|ts|nfs) + number`` (e.g. ``foopub01``), which are
+           matched against ``prefix(cn)?_?type?_?number$`` case-insensitively.
+
+        Raises:
+            ValueError: if the fuzzy match resolves to multiple clusters.
+        """
         with self._lock:
-            return self._clusters_by_name.get(name)
+            # 1. Exact match (for full cluster names).
+            cluster = self._clusters_by_name.get(name)
+            if cluster is not None:
+                return cluster
+
+            clusters = list(self._clusters_by_name.values())
+
+        # 2. Regex fuzzy match (for shorthand cluster names).
+        # Pattern: prefix + (pub|ts|nfs) + number
+        match = re.match(r"(?i)(.*)(pub|ts|nfs)(\d{1,5})", name)
+        if match:
+            regexp = f"{match.group(1)}(cn)?_?{match.group(2)}?_?{match.group(3)}$"
+        else:
+            regexp = name
+
+        try:
+            compiled = re.compile(regexp, re.IGNORECASE)
+        except re.error:
+            return None
+
+        matched = [c for c in clusters if compiled.match(c.name)]
+        if not matched:
+            return None
+        if len(matched) == 1:
+            return matched[0]
+
+        cluster_names = ", ".join(c.name for c in matched)
+        raise ValueError(f"Cluster is not unique: {cluster_names}")
 
     def get_all_clusters(self) -> List[ClusterInfo]:
         with self._lock:

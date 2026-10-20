@@ -104,6 +104,69 @@ class TestClusterRegistry:
         assert registry.get_cluster_by_name("cluster-missing") is None
         assert {c.name for c in registry.get_all_clusters()} == {"cluster-a", "cluster-b"}
 
+    def test_get_cluster_by_name_exact_match_takes_priority(self):
+        registry = ClusterRegistry()
+        clusters = [_make_cluster("foo_pub_01"), _make_cluster("foopub01")]
+
+        with patch("mcp_clickhouse.utils_clusters._fetch_clusters_from_adminserver", return_value=clusters):
+            registry.load()
+
+        # Even though the shorthand "foopub01" would fuzzy-match "foo_pub_01",
+        # an exact match on the full name must win.
+        assert registry.get_cluster_by_name("foopub01").name == "foopub01"
+
+    def test_get_cluster_by_name_fuzzy_matches_shorthand(self):
+        registry = ClusterRegistry()
+        clusters = [_make_cluster("foo_pub_01"), _make_cluster("bar_ts_2")]
+
+        with patch("mcp_clickhouse.utils_clusters._fetch_clusters_from_adminserver", return_value=clusters):
+            registry.load()
+
+        # Shorthand names resolve to the full cluster name via regex.
+        assert registry.get_cluster_by_name("foopub01").name == "foo_pub_01"
+        assert registry.get_cluster_by_name("barts2").name == "bar_ts_2"
+
+    def test_get_cluster_by_name_fuzzy_matches_cn_variant(self):
+        registry = ClusterRegistry()
+        clusters = [_make_cluster("foocn_pub_01")]
+
+        with patch("mcp_clickhouse.utils_clusters._fetch_clusters_from_adminserver", return_value=clusters):
+            registry.load()
+
+        # The optional "cn" segment is matched by the fuzzy pattern.
+        assert registry.get_cluster_by_name("foopub01").name == "foocn_pub_01"
+
+    def test_get_cluster_by_name_is_case_insensitive(self):
+        registry = ClusterRegistry()
+        clusters = [_make_cluster("foo_pub_01")]
+
+        with patch("mcp_clickhouse.utils_clusters._fetch_clusters_from_adminserver", return_value=clusters):
+            registry.load()
+
+        assert registry.get_cluster_by_name("FOOPUB01").name == "foo_pub_01"
+
+    def test_get_cluster_by_name_no_match_returns_none(self):
+        registry = ClusterRegistry()
+        clusters = [_make_cluster("foo_pub_01")]
+
+        with patch("mcp_clickhouse.utils_clusters._fetch_clusters_from_adminserver", return_value=clusters):
+            registry.load()
+
+        assert registry.get_cluster_by_name("bazpub09") is None
+        # A name that doesn't match the shorthand pattern and isn't an exact
+        # name resolves to nothing either.
+        assert registry.get_cluster_by_name("unknown-cluster") is None
+
+    def test_get_cluster_by_name_ambiguous_match_raises(self):
+        registry = ClusterRegistry()
+        clusters = [_make_cluster("foo_pub_01"), _make_cluster("foo_pub01")]
+
+        with patch("mcp_clickhouse.utils_clusters._fetch_clusters_from_adminserver", return_value=clusters):
+            registry.load()
+
+        with pytest.raises(ValueError, match="Cluster is not unique"):
+            registry.get_cluster_by_name("foopub01")
+
     def test_load_failure_propagates_and_keeps_index_empty(self):
         registry = ClusterRegistry()
 

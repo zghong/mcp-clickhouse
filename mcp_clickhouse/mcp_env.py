@@ -234,3 +234,53 @@ _MCP_CONFIG_INSTANCE = None
 def get_mcp_config():
     """Gets the singleton instance of the same ClickHouseConfig (MCP-server-side settings)."""
     return get_config()
+
+class ClusterUnspecifiedMode(str, Enum):
+    """How tools should behave when no cluster_name is given."""
+
+    PROMPT = "prompt"
+    FALLBACK = "fallback"
+
+    @classmethod
+    def values(cls) -> list[str]:
+        return [mode.value for mode in cls]
+
+@dataclass
+class ClusterRegistryConfig:
+    """Configuration for the adminserver-backed ClickHouse cluster registry.
+
+    Optional environment variables (with defaults):
+        CLICKHOUSE_CLUSTER_REGISTRY_ENABLED: Enable loading cluster info from
+            adminserver (default: false)
+        CLICKHOUSE_CLUSTER_REGISTRY_REFRESH_INTERVAL: Seconds between background
+            refreshes of the cluster registry. 0 disables background refresh and
+            only loads once at startup (default: 0)
+        CLICKHOUSE_CLUSTER_UNSPECIFIED_MODE: "prompt" or "fallback" — behavior when
+            a tool is called without cluster_name and the registry is enabled
+            (default: prompt)
+    """
+
+    @property
+    def enabled(self) -> bool:
+        return os.getenv("CLICKHOUSE_CLUSTER_REGISTRY_ENABLED", "false").lower() == "true"
+
+    @property
+    def refresh_interval(self) -> float:
+        return float(os.getenv("CLICKHOUSE_CLUSTER_REGISTRY_REFRESH_INTERVAL", "0"))
+
+    @property
+    def unspecified_mode(self) -> str:
+        mode = os.getenv("CLICKHOUSE_CLUSTER_UNSPECIFIED_MODE", ClusterUnspecifiedMode.PROMPT.value).lower()
+        if mode not in ClusterUnspecifiedMode.values():
+            valid_options = ", ".join(f'"{m}"' for m in ClusterUnspecifiedMode.values())
+            raise ValueError(f"Invalid CLICKHOUSE_CLUSTER_UNSPECIFIED_MODE '{mode}'. Valid options: {valid_options}")
+        return mode
+
+_CLUSTER_REGISTRY_CONFIG_INSTANCE = None
+
+def get_cluster_registry_config() -> ClusterRegistryConfig:
+    """Gets the singleton instance of ClusterRegistryConfig."""
+    global _CLUSTER_REGISTRY_CONFIG_INSTANCE
+    if _CLUSTER_REGISTRY_CONFIG_INSTANCE is None:
+        _CLUSTER_REGISTRY_CONFIG_INSTANCE = ClusterRegistryConfig()
+    return _CLUSTER_REGISTRY_CONFIG_INSTANCE

@@ -17,7 +17,10 @@ from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from starlette.responses import PlainTextResponse
 from dataclasses import dataclass, field, asdict
 
-from mcp_clickhouse.mcp_env import get_config, get_mcp_config, TransportType
+from mcp_clickhouse.mcp_env import (ClusterUnspecifiedMode,
+                                    get_cluster_registry_config, get_config,
+                                    get_mcp_config, TransportType)
+from mcp_clickhouse.utils_clusters import get_cluster_registry
 
 
 @dataclass
@@ -69,6 +72,26 @@ QUERY_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 atexit.register(lambda: QUERY_EXECUTOR.shutdown(wait=True))
 
 load_dotenv()
+
+def _init_cluster_registry() -> None:
+    """Load the adminserver-backed cluster registry at startup, if enabled.
+
+    A failed initial load is fatal: the registry was explicitly requested, so
+    starting up with an empty/stale cluster index would be misleading.
+    """
+    cluster_registry_config = get_cluster_registry_config()
+    if not cluster_registry_config.enabled:
+        return
+
+    registry = get_cluster_registry()
+    registry.load()
+
+    refresh_interval = cluster_registry_config.refresh_interval
+    if refresh_interval > 0:
+        registry.start_auto_refresh(refresh_interval)
+        atexit.register(registry.stop_auto_refresh)
+
+_init_cluster_registry()
 
 # Configure authentication for HTTP/SSE transports (from a1f3639).
 # A single static bearer token keeps the implementation simple; OAuth/JWT
@@ -199,13 +222,60 @@ def _serialize_tool_result(obj: Any) -> str:
     """Serialize a tool result to a JSON string (unified contract from 6e04286)."""
     return json.dumps(_stringify_unsafe_integers(obj), default=str)
 
+def _check_cluster_specified(cluster_name: Optional[str]) -> None:
+    """Enforce CLICKHOUSE_CLUSTER_UNSPECIFIED_MODE when the registry is enabled.
 
+    In "prompt" mode, tools must be called with an explicit cluster_name once
+    the adminserver-backed registry is enabled — otherwise it's ambiguous which
+    of the many registered clusters the caller means.
+    """
+    if cluster_name:
+        return
+
+    cluster_registry_config = get_cluster_registry_config()
+    if not cluster_registry_config.enabled:
+        return
+
+    if cluster_registry_config.unspecified_mode == ClusterUnspecifiedMode.PROMPT.value:
+        raise ToolError(
+            "No cluster_name specified. This server has multiple ClickHouse clusters "
+            "registered — call list_clusters to discover available clusters, then pass "
+            "cluster_name to this tool. Set CLICKHOUSE_CLUSTER_UNSPECIFIED_MODE=fallback "
+            "to default to CLICKHOUSE_HOST instead when cluster_name is omitted."
+        )
+
+def list_clusters(name: Optional[str] = None) -> str:
+    """List ClickHouse clusters registered in the adminserver cluster registry.
+
+    Use this to discover the cluster_name values accepted by other tools
+    (list_databases, list_tables, run_select_query). Only available when
+    CLICKHOUSE_CLUSTER_REGISTRY_ENABLED=true.
+
+    Args:
+        name: Return only the cluster with this exact name, if any
+    """
+    registry = get_cluster_registry()
+    if name:
+        cluster = registry.get_cluster_by_name(name)
+        clusters = [cluster] if cluster else []
+    else:
+        clusters = registry.get_all_clusters()
+
+    logger.info("Listing clusters (name=%s): %d found", name, len(clusters))
+    return _serialize_tool_result([cluster.to_public_dict() for cluster in clusters])
 
 @mcp.tool()
-def list_databases():
-    """List available ClickHouse databases"""
-    logger.info("Listing all databases")
-    client = create_clickhouse_client()
+def list_databases(cluster_name: Optional[str] = None) -> str:
+    """List available ClickHouse databases
+
+    Args:
+        cluster_name: Name of a registered ClickHouse cluster to query (see
+            list_clusters). If omitted, uses the default cluster configured via
+            CLICKHOUSE_HOST.
+    """
+    _check_cluster_specified(cluster_name)
+    logger.info(f"Listing all databases (cluster_name={cluster_name})")
+    client = create_clickhouse_client(cluster_name)
     result = client.command("SHOW DATABASES")
 
     # Convert newline-separated string to list and trim whitespace
@@ -219,11 +289,27 @@ def list_databases():
 
 
 @mcp.tool()
-def list_tables(database: str, like: Optional[str] = None, not_like: Optional[str] = None):
+def list_tables(database: str, like: Optional[str] = None, not_like: Optional[str] = None, cluster_name: Optional[str] = None):
     """List available ClickHouse tables in a database, including schema, comment,
-    row count, and column count."""
-    logger.info(f"Listing tables in database '{database}'")
-    client = create_clickhouse_client()
+    row count, and column count.
+
+    Args:
+        database: The database to list tables from
+        like: Optional LIKE pattern to filter table names
+        not_like: Optional NOT LIKE pattern to exclude table names
+        cluster_name: Name of a registered ClickHouse cluster to query (see
+            list_clusters). If omitted, uses the default cluster configured via
+            CLICKHOUSE_HOST.
+    """
+    _check_cluster_specified(cluster_name)
+    logger.info(
+        "Listing tables in database '%s' with like=%s, not_like=%s, cluster_name=%s",
+        database,
+        like,
+        not_like,
+        cluster_name,
+    )
+    client = create_clickhouse_client(cluster_name)
     query = f"SELECT database, name, engine, create_table_query, dependencies_database, dependencies_table, engine_full, sorting_key, primary_key, total_rows, total_bytes, total_bytes_uncompressed, parts, active_parts, total_marks, comment FROM system.tables WHERE database = {format_query_value(database)}"
     if like:
         query += f" AND name LIKE {format_query_value(like)}"
@@ -252,9 +338,9 @@ def list_tables(database: str, like: Optional[str] = None, not_like: Optional[st
     return _serialize_tool_result([asdict(table) for table in tables])
 
 
-def execute_query(query: str, params: Optional[Dict[str, Any]] = None, query_id: Optional[str] = None):
+def execute_query(query: str, params: Optional[Dict[str, Any]] = None, query_id: Optional[str] = None, cluster_name: Optional[str] = None):
     """Execute a query in a worker thread (off the event loop, cb75c27)."""
-    client = create_clickhouse_client()
+    client = create_clickhouse_client(cluster_name)
     read_only = get_readonly_setting(client)
     settings = {"readonly": read_only}
     if query_id:
@@ -264,24 +350,32 @@ def execute_query(query: str, params: Optional[Dict[str, Any]] = None, query_id:
     logger.info(f"Query returned {len(res.result_rows)} rows")
     return {"columns": res.column_names, "rows": res.result_rows}
 
-def _cancel_query(query_id: str) -> None:
+def _cancel_query(query_id: str, cluster_name: Optional[str] = None) -> None:
     """Best-effort server-side KILL QUERY for an in-flight query (0893019)."""
     try:
-        client = create_clickhouse_client()
+        client = create_clickhouse_client(cluster_name)
         client.command(f"KILL QUERY WHERE query_id = {format_query_value(query_id)}")
         logger.info(f"Successfully cancelled query {query_id}")
     except Exception as e:
         logger.warning(f"Failed to cancel query {query_id}: {e}")
 
 @mcp.tool()
-async def run_select_query(query: str, params: Optional[Dict[str, Any]] = None) -> str:
+async def run_select_query(query: str, params: Optional[Dict[str, Any]] = None, cluster_name: Optional[str] = None) -> str:
     """Run a SELECT query in a ClickHouse database.
 
     Bind params by name with ClickHouse placeholders such as {name:String}
     (native parameter binding from 1cf9ab6). Values may be JSON scalars,
     nulls, or arrays; pass exact large integers as decimal strings.
+
+    Args:
+        query: The SQL query to execute
+        params: Optional named parameters bound via {name:Type} placeholders
+        cluster_name: Name of a registered ClickHouse cluster to query (see
+            list_clusters). If omitted, uses the default cluster configured via
+            CLICKHOUSE_HOST.
     """
-    logger.info(f"Executing SELECT query: {query}")
+    _check_cluster_specified(cluster_name)
+    logger.info(f"Executing SELECT query: {query} (cluster_name={cluster_name})")
     # Native {name:Type} placeholder binding only (1cf9ab6): keep parameters
     # out of client-side string formatting and raw binary paths.
     if params is not None:
@@ -299,7 +393,7 @@ async def run_select_query(query: str, params: Optional[Dict[str, Any]] = None) 
     try:
         # Await the worker-pool future asynchronously so the event loop keeps
         # serving other tool calls while a slow query runs (cb75c27).
-        future = QUERY_EXECUTOR.submit(execute_query, query, params, query_id)
+        future = QUERY_EXECUTOR.submit(execute_query, query, params, query_id, cluster_name)
         result = await asyncio.wait_for(asyncio.wrap_future(future), timeout=timeout_secs)
         return _serialize_tool_result(result)
     except concurrent.futures.TimeoutError:
@@ -310,13 +404,13 @@ async def run_select_query(query: str, params: Optional[Dict[str, Any]] = None) 
         logger.warning(f"Query timed out after {timeout_secs} seconds: {query}")
         if not future.cancel():
             # Already running: issue a server-side KILL QUERY (0893019)
-            await asyncio.to_thread(_cancel_query, query_id)
+            await asyncio.to_thread(_cancel_query, query_id, cluster_name)
         raise ToolError(f"Query timed out after {timeout_secs} seconds")
     except asyncio.CancelledError:
         # Client cancelled the tool call: cancel the future, and if it is
         # already running, issue a server-side KILL QUERY (0893019).
         if not future.cancel():
-            await asyncio.to_thread(_cancel_query, query_id)
+            await asyncio.to_thread(_cancel_query, query_id, cluster_name)
         raise
     except ToolError:
         raise
@@ -424,6 +518,7 @@ def _create_clickhouse_client(client_config: dict):
     )
 
     try:
+        logger.info(f"Connecting to ClickHouse server... {client_config}")
         client = clickhouse_connect.get_client(autogenerate_session_id=False, **client_config)
         # Test the connection
         version = client.server_version
@@ -436,13 +531,25 @@ def _create_clickhouse_client(client_config: dict):
         raise
 
 
-def create_clickhouse_client():
+def create_clickhouse_client(cluster_name: Optional[str] = None):
     """Return a cached, reused ClickHouse client (0893019).
 
     Falls back to per-call creation only if the cached client cannot be
     health-checked, so a broken connection never blocks tool calls.
+
+    With cluster_name, connect to a cluster registered in the adminserver
+    cluster registry instead of the default CLICKHOUSE_HOST cluster.
     """
-    client_config = get_config().get_client_config()
+    if cluster_name:
+        cluster = get_cluster_registry().get_cluster_by_name(cluster_name)
+        if cluster is None:
+            raise ToolError(
+                f"Unknown ClickHouse cluster '{cluster_name}'. Call list_clusters to see "
+                "available clusters."
+            )
+        client_config = cluster.get_client_config()
+    else:
+        client_config = get_config().get_client_config()
     key = _client_cache_key(client_config)
 
     with _client_cache_lock:
@@ -503,3 +610,9 @@ def get_readonly_setting(client) -> str:
             return read_only.value  # Respect server's readonly setting (likely 2)
     else:
         return "1"  # Default to basic read-only mode if setting isn't present
+
+# Register the cluster discovery tool only when the registry is enabled
+# (upstream registers it inside the CLICKHOUSE_ENABLED block).
+if get_cluster_registry_config().enabled:
+    mcp.add_tool(list_clusters)
+    logger.info("Cluster registry enabled: list_clusters tool registered")

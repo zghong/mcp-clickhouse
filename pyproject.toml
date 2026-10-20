@@ -20,6 +20,11 @@ mcp-clickhouse = "mcp_clickhouse.main:main"
 Home = "https://github.com/ClickHouse/mcp-clickhouse"
 
 [project.optional-dependencies]
+cluster-registry = [
+    "sqlalchemy>=1.4",
+    "pymysql>=1.0",
+    "pycryptodome>=3.15",
+]
 dev = [
     "ruff",
     "pytest",
